@@ -9,11 +9,13 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
-@Transactional // Ensures Atomicity: all steps succeed or all fail
+@Transactional
 public class ReleaseService {
 
     @Autowired private DraftRepository draftRepo;
@@ -22,84 +24,109 @@ public class ReleaseService {
 
     /**
      * FR-2: Commit as Release Candidate (RC)
-     * Takes staged changes and creates an editable but grouped bundle.
      */
     public ReleaseResponse createReleaseCandidate(Integer regionId, String publisher) {
-        // 1. Fetch drafts for the region
         List<DraftConfig> drafts = draftRepo.findByRegionId(regionId);
         if (drafts.isEmpty()) {
             throw new RuntimeException("No drafts found for region: " + regionId);
         }
 
-        // 2. Create the Release object
         Release rc = new Release();
         rc.setRegionId(regionId);
         rc.setStatus(ReleaseStatus.RC);
         rc.setCreatedAt(LocalDateTime.now());
         rc.setPublisher(publisher);
 
-        // 3. Snapshot: Copy data from Draft to Immutable ConfigurationEntry rows
         for (DraftConfig draft : drafts) {
             ConfigurationEntry entry = new ConfigurationEntry();
             entry.setConfigKey(draft.getConfigKey());
             entry.setConfigValue(draft.getConfigValue());
-
-            // Link the snapshot to this specific RC
             rc.getEntries().add(entryRepo.save(entry));
         }
 
         Release saved = releaseRepo.save(rc);
-        return mapToResponse(saved);
+        return getMergedReleaseResponse(saved);
     }
 
     /**
-     * FR-3: Publish Version (Finalize)
-     * Generates X.Y version name, changes status to RELEASED, and clears drafts.
+     * FR-3: Publish Version
      */
     public ReleaseResponse publishRelease(Long rcId) {
-        // 1. Find the RC
         Release rc = releaseRepo.findById(rcId)
-                .orElseThrow(() -> new RuntimeException("RC ID " + rcId + " not found."));
+                .orElseThrow(() -> new RuntimeException("Release Candidate not found."));
 
-        // 2. Business Rule: Only RC can be published
         if (rc.getStatus() != ReleaseStatus.RC) {
-            throw new IllegalStateException("Only Release Candidates can be published. Current status: " + rc.getStatus());
+            throw new IllegalStateException("Only RCs can be published. Status is: " + rc.getStatus());
         }
 
-        // 3. Versioning Logic: X.Y (Section 3 of BRD)
-        // Find current max Y for this region (X) and increment by 1
+        // Generate X.Y version
         int nextY = releaseRepo.findMaxGlobalVersion(rc.getRegionId()) + 1;
         rc.setGlobalVersion(nextY);
         rc.setVersionName(rc.getRegionId() + "." + nextY);
 
-        // 4. Update Status to RELEASED (Makes it Immutable)
         rc.setStatus(ReleaseStatus.RELEASED);
+        Release published = releaseRepo.save(rc);
 
-        // 5. Cleanup: Delete Drafts once they are successfully published
+        // Clear drafts after successful publish
         draftRepo.deleteByRegionId(rc.getRegionId());
 
-        Release published = releaseRepo.save(rc);
-        return mapToResponse(published);
+        return getMergedReleaseResponse(published);
     }
 
     /**
-     * FR-4: Database State Reconstruction
-     * Retrieves the exact state of any version.
+     * FR-4: Reconstruct specific version
      */
     public ReleaseResponse getVersion(String versionName) {
         Release release = releaseRepo.findByVersionName(versionName)
                 .orElseThrow(() -> new RuntimeException("Version " + versionName + " not found."));
 
-        return mapToResponse(release);
+        return getMergedReleaseResponse(release);
     }
 
     /**
-     * Helper Method: Maps Entity (DB structure) to DTO (API Response)
+     * FR-8: Logic to merge Global (0.Y) and Regional (X.Y) states.
      */
-    private ReleaseResponse mapToResponse(Release release) {
-        List<ConfigEntryDTO> entries = release.getEntries().stream()
-                .map(e -> new ConfigEntryDTO(e.getConfigKey(), e.getConfigValue()))
-                .collect(Collectors.toList());
+    public Map<String, String> getVersionState(String versionName) {
+        String[] parts = versionName.split("\\.");
+        int regionId = Integer.parseInt(parts[0]);
+        int globalVer = Integer.parseInt(parts[1]);
+
+        Map<String, String> finalMap = new HashMap<>();
+
+        // 1. Inherit from Global (0.Y) if we are in a region
+        if (regionId != 0) {
+            String globalName = releaseRepo.findLatestGlobalVersionName();
+            finalMap.putAll(fetchRawMapFromDb(globalName));
+        }
+
+        // 2. Overlay Regional (X.Y) entries
+        finalMap.putAll(fetchRawMapFromDb(versionName));
+
+        return finalMap;
+    }
+
+    /**
+     * Helper: Maps a Release Entity into a Merged DTO Response.
+     * Uses Java 21 .toList() for cleaner syntax.
+     */
+    private ReleaseResponse getMergedReleaseResponse(Release release) {
+        Map<String, String> mergedData;
+
+        // If RELEASED, we can perform the full X.Y inheritance merge
+        if (release.getStatus() == ReleaseStatus.RELEASED && release.getVersionName() != null) {
+            mergedData = getVersionState(release.getVersionName());
+        } else {
+            // For RC, we show only what is currently inside the bundle
+            mergedData = release.getEntries().stream()
+                    .collect(Collectors.toMap(
+                            ConfigurationEntry::getConfigKey,
+                            ConfigurationEntry::getConfigValue,
+                            (a, b) -> b));
+        }
+
+        List<ConfigEntryDTO> entryDTOs = mergedData.entrySet().stream()
+                .map(e -> new ConfigEntryDTO(e.getKey(), e.getValue()))
+                .toList(); // Java 21 syntax
 
         return new ReleaseResponse(
                 release.getId(),
@@ -107,7 +134,17 @@ public class ReleaseService {
                 release.getRegionId(),
                 release.getStatus().name(),
                 release.getPublisher(),
-                entries
+                entryDTOs
         );
+    }
+
+    private Map<String, String> fetchRawMapFromDb(String versionName) {
+        return releaseRepo.findByVersionName(versionName)
+                .map(r -> r.getEntries().stream()
+                        .collect(Collectors.toMap(
+                                ConfigurationEntry::getConfigKey,
+                                ConfigurationEntry::getConfigValue,
+                                (a, b) -> b)))
+                .orElse(Map.of());
     }
 }
