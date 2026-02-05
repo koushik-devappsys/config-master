@@ -24,11 +24,12 @@ public class ReleaseService {
 
     /**
      * FR-2: Commit as Release Candidate (RC)
+     * Groups current drafts into a temporary, editable bundle.
      */
     public ReleaseResponse createReleaseCandidate(Integer regionId, String publisher) {
         List<DraftConfig> drafts = draftRepo.findByRegionId(regionId);
         if (drafts.isEmpty()) {
-            throw new RuntimeException("No drafts found for region: " + regionId);
+            throw new RuntimeException("No drafts found to commit for region: " + regionId);
         }
 
         Release rc = new Release();
@@ -37,6 +38,7 @@ public class ReleaseService {
         rc.setCreatedAt(LocalDateTime.now());
         rc.setPublisher(publisher);
 
+        // Snapshot: Create persistent entries from current drafts
         for (DraftConfig draft : drafts) {
             ConfigurationEntry entry = new ConfigurationEntry();
             entry.setConfigKey(draft.getConfigKey());
@@ -45,21 +47,22 @@ public class ReleaseService {
         }
 
         Release saved = releaseRepo.save(rc);
-        return getMergedReleaseResponse(saved);
+        return mapToMergedResponse(saved);
     }
 
     /**
      * FR-3: Publish Version
+     * Assigns the X.Y version, makes data immutable, and clears the staging area.
      */
     public ReleaseResponse publishRelease(Long rcId) {
         Release rc = releaseRepo.findById(rcId)
                 .orElseThrow(() -> new RuntimeException("Release Candidate not found."));
 
         if (rc.getStatus() != ReleaseStatus.RC) {
-            throw new IllegalStateException("Only RCs can be published. Status is: " + rc.getStatus());
+            throw new IllegalStateException("Only Release Candidates can be published.");
         }
 
-        // Generate X.Y version
+        // Logic for X.Y: Increment the release index (Y) for this specific region (X)
         int nextY = releaseRepo.findMaxGlobalVersion(rc.getRegionId()) + 1;
         rc.setGlobalVersion(nextY);
         rc.setVersionName(rc.getRegionId() + "." + nextY);
@@ -67,10 +70,10 @@ public class ReleaseService {
         rc.setStatus(ReleaseStatus.RELEASED);
         Release published = releaseRepo.save(rc);
 
-        // Clear drafts after successful publish
+        // FR-1: Clear drafts after they are permanently versioned
         draftRepo.deleteByRegionId(rc.getRegionId());
 
-        return getMergedReleaseResponse(published);
+        return mapToMergedResponse(published);
     }
 
     /**
@@ -80,53 +83,53 @@ public class ReleaseService {
         Release release = releaseRepo.findByVersionName(versionName)
                 .orElseThrow(() -> new RuntimeException("Version " + versionName + " not found."));
 
-        return getMergedReleaseResponse(release);
+        return mapToMergedResponse(release);
     }
 
     /**
-     * FR-8: Logic to merge Global (0.Y) and Regional (X.Y) states.
+     * FR-8: The Inheritance Engine.
+     * Reconstructs the state by layering Regional (X.Y) over Global (0.Y).
      */
     public Map<String, String> getVersionState(String versionName) {
         String[] parts = versionName.split("\\.");
         int regionId = Integer.parseInt(parts[0]);
         int globalVer = Integer.parseInt(parts[1]);
 
-        Map<String, String> finalMap = new HashMap<>();
+        Map<String, String> mergedConfig = new HashMap<>();
 
-        // 1. Inherit from Global (0.Y) if we are in a region
+        // 1. If this is a Regional version (X > 0), load the Global Baseline (0.Y) first
         if (regionId != 0) {
-            String globalName = releaseRepo.findLatestGlobalVersionName();
-            finalMap.putAll(fetchRawMapFromDb(globalName));
+            String globalVersionName = "0." + globalVer;
+            mergedConfig.putAll(fetchRawData(globalVersionName));
         }
 
-        // 2. Overlay Regional (X.Y) entries
-        finalMap.putAll(fetchRawMapFromDb(versionName));
+        // 2. Load the Regional Overrides (X.Y). Matches here will overwrite Global values.
+        mergedConfig.putAll(fetchRawData(versionName));
 
-        return finalMap;
+        return mergedConfig;
     }
 
     /**
-     * Helper: Maps a Release Entity into a Merged DTO Response.
-     * Uses Java 21 .toList() for cleaner syntax.
+     * Helper: Unified Mapper to return the "Full Truth" (Merged Global + Regional)
      */
-    private ReleaseResponse getMergedReleaseResponse(Release release) {
-        Map<String, String> mergedData;
+    private ReleaseResponse mapToMergedResponse(Release release) {
+        Map<String, String> effectiveEntries;
 
-        // If RELEASED, we can perform the full X.Y inheritance merge
+        // If the version is not yet published (RC), we only show its specific contents.
+        // If it IS published, we show the full inherited state (Global + Regional).
         if (release.getStatus() == ReleaseStatus.RELEASED && release.getVersionName() != null) {
-            mergedData = getVersionState(release.getVersionName());
+            effectiveEntries = getVersionState(release.getVersionName());
         } else {
-            // For RC, we show only what is currently inside the bundle
-            mergedData = release.getEntries().stream()
+            effectiveEntries = release.getEntries().stream()
                     .collect(Collectors.toMap(
                             ConfigurationEntry::getConfigKey,
                             ConfigurationEntry::getConfigValue,
-                            (a, b) -> b));
+                            (existing, replacement) -> replacement));
         }
 
-        List<ConfigEntryDTO> entryDTOs = mergedData.entrySet().stream()
+        List<ConfigEntryDTO> entryDTOs = effectiveEntries.entrySet().stream()
                 .map(e -> new ConfigEntryDTO(e.getKey(), e.getValue()))
-                .toList(); // Java 21 syntax
+                .toList(); // Java 21
 
         return new ReleaseResponse(
                 release.getId(),
@@ -138,7 +141,10 @@ public class ReleaseService {
         );
     }
 
-    private Map<String, String> fetchRawMapFromDb(String versionName) {
+    /**
+     * Helper: Fetches raw key-value pairs from the snapshot table
+     */
+    private Map<String, String> fetchRawData(String versionName) {
         return releaseRepo.findByVersionName(versionName)
                 .map(r -> r.getEntries().stream()
                         .collect(Collectors.toMap(
