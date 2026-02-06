@@ -3,6 +3,8 @@ package com.configsystem.master.controller;
 import com.configsystem.master.entity.DraftConfig;
 import com.configsystem.master.repository.DraftRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -23,5 +25,19 @@ public class DraftController {
     @GetMapping
     public List<DraftConfig> getAllDrafts() {
         return draftRepo.findAll();
+    }
+
+    @Transactional
+    @DeleteMapping("/{regionId}/{key}")
+    public ResponseEntity<Void> deleteDraft(@PathVariable Integer regionId, @PathVariable String key) {
+        draftRepo.deleteByKeyAndRegion(key, regionId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @Transactional
+    @DeleteMapping("/{regionId}/clear")
+    public ResponseEntity<Void> clearAllDrafts(@PathVariable Integer regionId) {
+        draftRepo.deleteByRegionId(regionId);
+        return ResponseEntity.noContent().build();
     }
 }
