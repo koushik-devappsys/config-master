@@ -125,10 +125,26 @@ public class ReleaseService {
     }
 
     private Map<String, ConfigurationEntry> getLatestSnapshotMap(Integer regionId) {
-        return releaseRepo.findLatestReleasedByRegion(regionId)
-                .map(r -> r.getEntries().stream()
-                        .collect(Collectors.toMap(ConfigurationEntry::getConfigKey, e -> e, (a, b) -> b)))
-                .orElse(new HashMap<>());
+
+        Map<String,ConfigurationEntry> snapshot=new HashMap<>();
+
+        releaseRepo.findLatestReleasedByRegion(regionId).ifPresent(release->{
+            List<ConfigurationEntry> newCopies=release.getEntries().stream()
+                    .map(oldEntry-> {
+                        ConfigurationEntry newEntry = new ConfigurationEntry();
+                        newEntry.setConfigKey(oldEntry.getConfigKey());
+                        newEntry.setConfigValue(oldEntry.getConfigValue());
+                        return newEntry;
+                    }
+            ).toList();
+
+            List<ConfigurationEntry> savedCopy=entryRepo.saveAll(newCopies);
+
+            for (ConfigurationEntry saved : savedCopy){
+                snapshot.put(saved.getConfigKey(),saved);
+            }
+        });
+        return snapshot;
     }
 
     private ReleaseResponse getMergedReleaseResponse(Release release) {
